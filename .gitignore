@@ -28,3 +28,38 @@ dist-ssr
 !.env.example
 node_modules/
 dist/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/node_modules/
+frontend/coverage/
+backend/data/
+
+# Local configuration and data
+.env
+.env.*
+.env.example
+data/local/
+data/**/*.zarr/
+data/**/*.grib*
+data/**/*.nc
+data/**/*.tif
+data/**/*.tiff
+AGENTS.md
+
+# Tooling and editor files
+.coverage
+.coverage.*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
