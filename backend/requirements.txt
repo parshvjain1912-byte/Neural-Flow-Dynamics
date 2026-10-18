@@ -1,0 +1,8 @@
+
+fastapi
+uvicorn[standard]
+xarray
+cfgrib
+eccodes
+numpy
+pandas
