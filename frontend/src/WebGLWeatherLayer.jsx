@@ -1,25 +1,14 @@
 import { COLOR_SCALES, buildLut, encode } from "./Colorscales";
 
+// The backend sends raw SI units; these convert them to the units used by COLOR_SCALES.
 const FIELD_CONFIG = {
   temperature: { key: "t2m", convert: v => v - 273.15 },
   wind: { key: "wind_speed", convert: v => v },
-  // Prefers mean-sea-level pressure ("msl"); falls back to surface pressure ("sp").
-  pressure: { key: "msl", fallback: "sp", convert: v => v / 100 },
+  pressure: { key: "sp", convert: v => v / 100 },
   rainfall: { key: "tp", convert: v => v * 1000 },
 };
 
-const FIELD_ALIASES = {
-  t2m: "temperature", temperature: "temperature",
-  wind_speed: "wind", wind: "wind", u10: "wind", v10: "wind",
-  sp: "pressure", pressure: "pressure",
-  tp: "rainfall", rainfall: "rainfall",
-};
-
 const EARTH_CIRCUMFERENCE = 40075016.686;
-
-function normalizeFieldName(name) {
-  return FIELD_ALIASES[String(name || "temperature").toLowerCase()] || "temperature";
-}
 
 function mercatorX(lon) {
   return (lon + 180) / 360;
@@ -30,57 +19,18 @@ function mercatorY(lat) {
   return (1 - Math.asinh(Math.tan(r)) / Math.PI) / 2;
 }
 
-function flattenGrid(value) {
-  if (ArrayBuffer.isView(value)) return Array.from(value);
-  if (!Array.isArray(value)) return [];
-  return value.flat(Infinity);
-}
-
-function getBinaryField(frame, key) {
-  const { data, metadata } = frame || {};
-  if (!data || !metadata?.variables || !metadata?.shape) return null;
-
-  const variableIndex = metadata.variables.indexOf(key);
-  if (variableIndex < 0) return null;
-
-  const [timeCount, variableCount, rows, cols] = metadata.shape;
-  const timeIndex = frame.timeIndex ?? 0;
-
-  if (
-    timeIndex < 0 || timeIndex >= timeCount ||
-    variableCount !== metadata.variables.length
-  ) return null;
-
-  const start = (timeIndex * variableCount + variableIndex) * rows * cols;
-  return data.subarray(start, start + rows * cols);
-}
-
-function findArray(objects, keys) {
-  for (const obj of objects) {
-    if (!obj || typeof obj !== "object") continue;
-    for (const key of keys) {
-      const value = obj[key];
-      if (Array.isArray(value) || ArrayBuffer.isView(value)) return Array.from(value);
-    }
-  }
-  return null;
-}
-
-function extractCoordinates(weather, frame) {
-  const sources = [weather, frame, weather?.grid, frame?.grid, weather?.metadata];
-  const latitudes = findArray(sources, ["latitudes", "latitude", "lats", "lat"]);
-  const longitudes = findArray(sources, ["longitudes", "longitude", "lons", "lon"]);
-
-  if (!latitudes || !longitudes || latitudes.length < 2 || longitudes.length < 2) {
+// Sort latitudes north->south and longitudes west->east (and wrap to -180..180).
+function extractCoordinates({ latitude, longitude }) {
+  if (!latitude || !longitude || latitude.length < 2 || longitude.length < 2) {
     console.error("[NFD] Missing grid coordinates. Expected latitude/longitude arrays.");
     return null;
   }
 
-  const latOrder = latitudes.map((value, index) => ({ value: Number(value), index }))
+  const latOrder = Array.from(latitude).map((value, index) => ({ value: Number(value), index }))
     .filter(p => Number.isFinite(p.value))
     .sort((a, b) => b.value - a.value);
 
-  const lonOrder = longitudes.map((value, index) => ({ value: Number(value), index }))
+  const lonOrder = Array.from(longitude).map((value, index) => ({ value: Number(value), index }))
     .filter(p => Number.isFinite(p.value))
     .map(p => ({ ...p, value: ((p.value + 180) % 360 + 360) % 360 - 180 }))
     .sort((a, b) => a.value - b.value);
@@ -223,7 +173,6 @@ uniform float u_size;
 out float v_fade;
 void main() {
   v_fade = a_fade;
-  gl_Position = u_matrix * vec4(a_pos, 0.0, 1.0);
   gl_Position = u_matrix * vec4(a_pos.x + u_offset, a_pos.y, 0.0, 1.0);
   gl_PointSize = u_size * (0.3 + 0.7 * a_fade);
 }`;
@@ -323,7 +272,7 @@ export default class WebGLWeatherLayer {
 
   // coords: any payload with latitude/longitude arrays. frame: one frame object. layer: field name.
   update(coords, frame, layer, showWind) {
-    this.want = { coords, frame, layer: normalizeFieldName(layer) };
+    this.want = { coords, frame, layer };
     this.showWind = !!showWind;
     this.sync();
   }
@@ -333,7 +282,7 @@ export default class WebGLWeatherLayer {
     const { coords, frame, layer } = this.want;
     if (coords && coords !== this.applied.coords) {
       this.applied.coords = coords;
-      this.grid = extractCoordinates(coords, null);
+      this.grid = extractCoordinates(coords);
       this.mesh = this.grid ? mercatorMesh(this.grid) : null;
       this.uploadMesh();
       this.createParticles();
@@ -350,36 +299,13 @@ export default class WebGLWeatherLayer {
   }
 
   fieldValues(frame, name) {
-    const config = FIELD_CONFIG[name];
-    const binary = getBinaryField(frame, config.key)
-      ?? (config.fallback ? getBinaryField(frame, config.fallback) : null);
-
-    if (binary) {
-      const grid = reorderGrid(binary, this.grid);
-      if (!grid) return null;
-
-      for (let i = 0; i < grid.length; i++) {
-        grid[i] = Number.isFinite(grid[i]) ? config.convert(grid[i]) : NaN;
-      }
-      return grid;
-    }
-
-    let raw = frame[config.key] ?? (config.fallback ? frame[config.fallback] : undefined);
-
-    if (name === "wind" && raw == null) {
-      const u = flattenGrid(frame.u10);
-      const v = flattenGrid(frame.v10);
-      raw = u.map((x, i) => Math.hypot(Number(x), Number(v[i])));
-    }
-
-    const grid = reorderGrid(flattenGrid(raw), this.grid);
+    const { key, convert } = FIELD_CONFIG[name];
+    const grid = reorderGrid(frame[key], this.grid);
     if (!grid) return null;
-
-    const out = new Float32Array(grid.length);
     for (let i = 0; i < grid.length; i++) {
-      out[i] = Number.isFinite(grid[i]) ? config.convert(grid[i]) : NaN;
+      grid[i] = Number.isFinite(grid[i]) ? convert(grid[i]) : NaN;
     }
-    return out;
+    return grid;
   }
 
   loadField(frame, name, animate = true) {
@@ -401,11 +327,8 @@ export default class WebGLWeatherLayer {
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, this.grid.cols, this.grid.rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
 
-    const u = getBinaryField(frame, "u10") ?? flattenGrid(frame.u10);
-    const v = getBinaryField(frame, "v10") ?? flattenGrid(frame.v10);
-
-    this.windB = u.length && u.length === v.length
-      ? { u: reorderGrid(u, this.grid), v: reorderGrid(v, this.grid) } : null;
+    const { u10, v10 } = frame;
+    this.windB = u10 && v10 ? { u: reorderGrid(u10, this.grid), v: reorderGrid(v10, this.grid) } : null;
 
     this.activeLayer = name;
     if (!animate || !this.hasField) {
@@ -457,8 +380,6 @@ export default class WebGLWeatherLayer {
         x1 = x0 + span / 360; 
       }
 
-      //const west = mercatorX(b.getWest()), east = mercatorX(b.getEast());
-      //if (east > west) { x0 = Math.max(0, west); x1 = Math.min(1, east); }
       y0 = Math.max(0.001, mercatorY(b.getNorth()));
       y1 = Math.min(0.999, mercatorY(b.getSouth()));
     }

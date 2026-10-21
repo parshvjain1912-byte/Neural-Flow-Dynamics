@@ -16,7 +16,11 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import "./App.css";
 // @ts-expect-error NFD renderer is maintained as JavaScript.
 import WebGLWeatherLayer from "./nfd/WebGLWeatherLayer.jsx";
-import { fetchNFDForecast, type NFDForecast } from "./nfd/binaryForecast";
+import {
+  fetchNFDForecast,
+  findClosestNFDFrameIndex,
+  type NFDForecast,
+} from "./nfd/binaryForecast";
 import { fetchJsonCached, isAbortError, RateLimitError } from "./lib/openMeteo";
 
 setWorkerUrl(workerUrl);
@@ -196,8 +200,9 @@ async function getForecast(
 
   const currentTime = String(c.time).slice(0, 13);
 
-  const current =
-    hourly.find(v => v.time.slice(0, 13) === currentTime) ?? hourly[0];
+  const current = {
+    ...(hourly.find(v => v.time.slice(0, 13) === currentTime) ?? hourly[0])
+  };
 
   current.temperature = number(c.temperature_2m);
   current.feelsLike = number(c.apparent_temperature);
@@ -271,63 +276,150 @@ async function getAirQuality(place: Place) {
   return json.current;
 }
 
+type WeatherAlert = {
+  title: string;
+  detail: string;
+  level: "high" | "medium" | "low";
+  time?: string;
+};
+
 function makeAlerts(
   data: WeatherData,
   windThreshold = 40,
   rainThreshold = 70
-) {
-  const c = data.current;
-  const alerts: { title: string; detail: string; level: string }[] = [];
+): WeatherAlert[] {
+  const alerts: WeatherAlert[] = [];
+  const now = Date.now();
+  const next24Hours = data.hourly
+    .filter(hour => hour.utc >= now && hour.utc <= now + 24 * 60 * 60 * 1000)
+    .slice(0, 24);
 
-  if (c.rain >= rainThreshold) {
+  const current = data.current;
+  const hoursToCheck = next24Hours.length
+    ? next24Hours
+    : [current];
+
+  const addForecastAlert = (
+    title: string,
+    detail: string,
+    level: WeatherAlert["level"],
+    hour: Hour
+  ) => {
     alerts.push({
-      title: "High precipitation probability",
-      detail: `${c.rain}% chance of precipitation in the selected hour.`,
-      level: "high"
+      title,
+      detail: `${detail} Expected around ${formatTime(hour.time, data.timezone)}.`,
+      level,
+      time: hour.time
     });
-  }
+  };
 
-  if (c.wind >= windThreshold) {
+  // Current conditions are checked separately because current.rain represents
+  // measured precipitation, while hourly.rain represents precipitation probability.
+  if (current.wind >= windThreshold) {
     alerts.push({
       title: "Strong winds",
-      detail: `Forecast wind speed is ${Math.round(c.wind)} km/h.`,
-      level: c.wind >= windThreshold + 20 ? "high" : "medium"
+      detail: `Current forecast wind speed is ${Math.round(current.wind)} km/h, at or above your ${windThreshold} km/h threshold.`,
+      level: current.wind >= windThreshold + 20 ? "high" : "medium",
+      time: current.time
     });
   }
 
-  if (c.temperature >= 40) {
+  if (current.temperature >= 40) {
     alerts.push({
       title: "High temperature",
-      detail: `Air temperature is ${Math.round(c.temperature)}°C.`,
-      level: "high"
+      detail: `Air temperature is ${Math.round(current.temperature)}°C. Heat exposure may be a concern.`,
+      level: current.temperature >= 45 ? "high" : "medium",
+      time: current.time
     });
-  }
-
-  if (c.temperature <= 3) {
+  } else if (current.temperature <= 3) {
     alerts.push({
       title: "Low temperature",
-      detail: `Air temperature is ${Math.round(c.temperature)}°C.`,
-      level: "medium"
+      detail: `Air temperature is ${Math.round(current.temperature)}°C. Cold-sensitive people and exposed plants may need extra care.`,
+      level: current.temperature <= 0 ? "high" : "medium",
+      time: current.time
     });
   }
 
-  if (c.code >= 95) {
+  if (current.code >= 95) {
     alerts.push({
       title: "Thunderstorm conditions",
-      detail: "A thunderstorm code is present in the current forecast.",
-      level: "high"
+      detail: `${weatherLabel(current.code)} is present in the current forecast. Check official local warnings and avoid exposed outdoor areas.`,
+      level: "high",
+      time: current.time
     });
   }
 
-  if (!alerts.length) {
-    alerts.push({
+  for (const hour of hoursToCheck) {
+
+
+    if (hour.rain >= rainThreshold) {
+      addForecastAlert(
+        "High precipitation probability",
+        `${Math.round(hour.rain)}% chance of precipitation`,
+        hour.rain >= 90 ? "high" : "medium",
+        hour
+      );
+    }
+
+    if (hour.wind >= windThreshold && hour.utc !== current.utc) {
+      addForecastAlert(
+        "Strong winds forecast",
+        `Wind speed may reach ${Math.round(hour.wind)} km/h`,
+        hour.wind >= windThreshold + 20 ? "high" : "medium",
+        hour
+      );
+    }
+
+    if (hour.temperature >= 40 && hour.utc !== current.utc) {
+      addForecastAlert(
+        "High temperature forecast",
+        `Temperature may reach ${Math.round(hour.temperature)}°C`,
+        hour.temperature >= 45 ? "high" : "medium",
+        hour
+      );
+    } else if (hour.temperature <= 3 && hour.utc !== current.utc) {
+      addForecastAlert(
+        "Low temperature forecast",
+        `Temperature may fall to ${Math.round(hour.temperature)}°C`,
+        hour.temperature <= 0 ? "high" : "medium",
+        hour
+      );
+    }
+
+    if (hour.code >= 95 && hour.utc !== current.utc) {
+      addForecastAlert(
+        "Thunderstorm forecast",
+        weatherLabel(hour.code),
+        "high",
+        hour
+      );
+    }
+  }
+
+  // Keep the panel useful without flooding it with repeated hourly alerts.
+  const unique = new Map<string, WeatherAlert>();
+  for (const alert of alerts) {
+    const key = `${alert.title}|${alert.time ?? ""}`;
+    if (!unique.has(key)) unique.set(key, alert);
+  }
+
+  const result = [...unique.values()]
+    .sort((a, b) => {
+      const rank = { high: 0, medium: 1, low: 2 };
+      return rank[a.level] - rank[b.level] ||
+        (a.time ?? "").localeCompare(b.time ?? "");
+    })
+    .slice(0, 12);
+
+  if (!result.length) {
+    return [{
       title: "No threshold alerts",
-      detail: "Current forecast values do not cross Atmos's configured thresholds. This is not an official all-clear.",
+      detail: "The current conditions and next 24 hours do not cross Atmos's configured thresholds. This is not an official all-clear.",
       level: "low"
-    });
+    }];
   }
 
-  return alerts;
+  return result;
 }
 
 function Chart({
@@ -1893,6 +1985,24 @@ export default function App() {
             <span>/</span>
             <b>{navItems.find(n => n.id === tab)?.label}</b>
           </div>
+
+          <nav className="top-nav" aria-label="Main navigation">
+            {([
+              ["overview", "Map"],
+              ["forecast", "Forecast"],
+              ["alerts", "Alerts"],
+              ["routes", "Routes"],
+              ["intelligence", "AI Assistant"]
+            ] as [Tab, string][]).map(([id, label]) => (
+              <button
+                key={id}
+                className={tab === id ? "active" : ""}
+                onClick={() => setTab(id)}
+              >
+                {label}
+              </button>
+            ))}
+          </nav>
 
           <div className="topbar-actions">
             <span className="live-status">
