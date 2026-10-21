@@ -187,7 +187,7 @@ export default function TinyFishAdvisories({ location }: Props) {
                     )}
 
                     {data.results.map((item, index) => {
-                        let safeUrl: URL | null = null;
+                        let safeUrl: URL | null;
 
                         try {
                             safeUrl = new URL(item.url);

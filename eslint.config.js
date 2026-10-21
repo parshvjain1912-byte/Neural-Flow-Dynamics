@@ -6,7 +6,8 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  // frontend/ and backend/ are the standalone map app and API; they have their own tooling.
+  globalIgnores(['dist', 'frontend', 'backend']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [
@@ -17,6 +18,10 @@ export default defineConfig([
     ],
     languageOptions: {
       globals: globals.browser,
+    },
+    rules: {
+      // Fetching data inside effects is the pattern used throughout this app.
+      'react-hooks/set-state-in-effect': 'off',
     },
   },
 ])
