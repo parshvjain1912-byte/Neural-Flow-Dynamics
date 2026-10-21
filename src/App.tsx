@@ -14,6 +14,9 @@ import {
 import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import "maplibre-gl/dist/maplibre-gl.css";
 import "./App.css";
+// @ts-expect-error NFD renderer is maintained as JavaScript.
+import WebGLWeatherLayer from "./nfd/WebGLWeatherLayer.jsx";
+import { fetchNFDForecast, type NFDForecast } from "./nfd/binaryForecast";
 import { fetchJsonCached, isAbortError, RateLimitError } from "./lib/openMeteo";
 
 setWorkerUrl(workerUrl);
@@ -479,6 +482,9 @@ function MapPanel({ place, layer, onSelect, hour }: {
   const heatCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const particleCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
+  const nfdLayerRef = useRef<any>(null);
+  const [nfdLayerReady, setNfdLayerReady] = useState(false);
+  const [nfdForecast, setNfdForecast] = useState<NFDForecast | null>(null);
   const markerRef = useRef<Marker | null>(null);
   const selectRef = useRef(onSelect);
   const layerRef = useRef(layer);
@@ -635,6 +641,22 @@ function MapPanel({ place, layer, onSelect, hour }: {
     mapRef.current = map;
     map.addControl(new NavigationControl({ showCompass: true }), "top-right");
 
+    map.once("load", () => {
+      const renderer = new WebGLWeatherLayer({
+        id: "nfd-weather-webgl",
+        alpha: 0.82,
+        particleCount: 5000,
+      });
+
+      const firstSymbol = map.getStyle().layers?.find(
+        (styleLayer) => styleLayer.type === "symbol"
+      );
+
+      map.addLayer(renderer as never, firstSymbol?.id);
+      nfdLayerRef.current = renderer;
+      setNfdLayerReady(true);
+    });
+
     const markerElement = document.createElement("div");
     markerElement.className = "map-marker";
     markerElement.innerHTML = "<span></span>";
@@ -661,6 +683,8 @@ function MapPanel({ place, layer, onSelect, hour }: {
       markerRef.current = null;
       map.remove();
       mapRef.current = null;
+      nfdLayerRef.current = null;
+      setNfdLayerReady(false);
     };
   }, []);
 
@@ -675,6 +699,67 @@ function MapPanel({ place, layer, onSelect, hour }: {
 
     markerRef.current?.setLngLat([place.lon, place.lat]);
   }, [place.lat, place.lon]);
+
+  const useNFD =
+    layer === "wind" || layer === "temperature" || layer === "rain";
+
+  // Load NFD's binary forecast for the active timeline date.
+  useEffect(() => {
+    const date =
+      hour?.time?.slice(0, 10) ??
+      new Date().toISOString().slice(0, 10);
+
+    const controller = new AbortController();
+    let disposed = false;
+
+    void fetchNFDForecast(date, controller.signal)
+      .then((forecast) => {
+        if (!disposed) setNfdForecast(forecast);
+      })
+      .catch((error: unknown) => {
+        if (disposed || controller.signal.aborted) return;
+        console.error("[Atmos/NFD] Forecast load failed:", error);
+      });
+
+    return () => {
+      disposed = true;
+      controller.abort();
+    };
+  }, [hour?.time?.slice(0, 10)]);
+
+  // Render NFD's forecast at the selected timeline hour.
+  useEffect(() => {
+    const map = mapRef.current;
+    const renderer = nfdLayerRef.current;
+
+    if (!map || !renderer || !nfdLayerReady || !nfdForecast) return;
+
+    const supported =
+      layer === "wind" || layer === "temperature" || layer === "rain";
+
+    renderer.enabled = supported;
+    map.triggerRepaint();
+
+    if (!supported) return;
+
+    const selectedHour = Number(hour?.time?.slice(11, 13) ?? "12");
+    const frameIndex = Math.max(
+      0,
+      Math.min(nfdForecast.frames.length - 1, Math.floor(selectedHour / 6))
+    );
+    const frame = nfdForecast.frames[frameIndex];
+
+    if (!frame) return;
+
+    renderer.update(
+      nfdForecast.coords,
+      frame,
+      layer === "rain" ? "rainfall" : layer,
+      layer === "wind" && playing
+    );
+
+    map.triggerRepaint();
+  }, [nfdLayerReady, nfdForecast, layer, hour?.time, playing]);
 
   // Fetch a grid only when the map viewport changes.
   // A snapped viewport key avoids requests for tiny pans.
@@ -1059,17 +1144,21 @@ function MapPanel({ place, layer, onSelect, hour }: {
     : "Loading weather…";
 
   const legend = layer === "wind"
-    ? ["Calm", "5", "15", "25", "40", "60+ km/h"]
+    ? ["0", "5", "10", "15", "20", "30 m/s"]
     : layer === "temperature"
-      ? ["−20°", "0°", "10°", "20°", "30°", "40°C+"]
-      : ["0", "20", "40", "60", "80", "100%"];
+      ? ["−45°", "−25°", "0°", "25°", "50°C"]
+      : layer === "rain"
+        ? ["0", "1", "5", "10", "25", "50 mm / 6h"]
+        : ["0", "20", "40", "60", "80", "100%"];
 
   const legendColors = legend.map((_, index) => {
     const values = layer === "wind"
-      ? [0, 5, 15, 25, 40, 60]
+      ? [0, 5, 10, 15, 20, 30]
       : layer === "temperature"
-        ? [-20, 0, 10, 20, 30, 40]
-        : [0, 20, 40, 60, 80, 100];
+        ? [-45, -25, 0, 25, 50]
+        : layer === "rain"
+          ? [0, 1, 5, 10, 25, 50]
+          : [0, 20, 40, 60, 80, 100];
 
     const [r, g, b] = colorFor(values[index], layer);
     return `rgb(${r},${g},${b})`;
@@ -1103,7 +1192,8 @@ function MapPanel({ place, layer, onSelect, hour }: {
           width: "100%",
           height: "100%",
           zIndex: 3,
-          pointerEvents: "none"
+          pointerEvents: "none",
+          display: useNFD ? "none" : undefined
         }}
       />
 
@@ -1116,7 +1206,8 @@ function MapPanel({ place, layer, onSelect, hour }: {
           width: "100%",
           height: "100%",
           zIndex: 4,
-          pointerEvents: "none"
+          pointerEvents: "none",
+          display: useNFD ? "none" : undefined
         }}
       />
 
@@ -1181,7 +1272,13 @@ function MapPanel({ place, layer, onSelect, hour }: {
           marginBottom: 7,
           opacity: 0.85
         }}>
-          {layer === "wind" ? "WIND SPEED" : layer.toUpperCase()}
+          {layer === "wind"
+            ? "WIND SPEED · M/S"
+            : layer === "temperature"
+              ? "TEMPERATURE · °C"
+              : layer === "rain"
+                ? "PRECIPITATION · MM / 6H"
+                : layer.toUpperCase()}
         </div>
 
         <div style={{
